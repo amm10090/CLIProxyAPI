@@ -57,6 +57,7 @@ jobs:
             --project "${PROJECT_ID}" \
             --region "${REGION}" \
             --platform managed \
+            --port 8317 \
             --source . \
             --quiet
 
