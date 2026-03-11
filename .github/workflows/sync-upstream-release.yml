@@ -13,11 +13,23 @@ jobs:
     outputs:
       has_new_release: ${{ steps.detect.outputs.has_new_release }}
       release_tag: ${{ steps.detect.outputs.release_tag }}
+      has_sync_pat: ${{ steps.pat.outputs.has_sync_pat }}
     steps:
       - name: Checkout fork repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Detect whether SYNC_PAT is configured
+        id: pat
+        env:
+          SYNC_PAT: ${{ secrets.SYNC_PAT }}
+        run: |
+          if [ -n "${SYNC_PAT}" ]; then
+            echo "has_sync_pat=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "has_sync_pat=false" >> "${GITHUB_OUTPUT}"
+          fi
 
       - name: Fetch upstream and origin tags
         run: |
@@ -30,6 +42,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          state_file=".github/upstream-release-state.json"
           latest_tag="$(
             curl -fsSL \
               -H "Authorization: Bearer ${GH_TOKEN}" \
@@ -45,8 +58,30 @@ jobs:
             exit 0
           fi
 
+          recorded_tag=""
+          if [ -f "${state_file}" ]; then
+            recorded_tag="$(
+              python3 - "${state_file}" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+data = json.loads(path.read_text(encoding="utf-8"))
+print(data.get("latest_release_tag", ""))
+PY
+            )"
+          fi
+
           if git ls-remote --exit-code --tags origin "refs/tags/${latest_tag}" >/dev/null 2>&1; then
-            echo "Latest upstream release already synced: ${latest_tag}"
+            echo "Latest upstream release already mirrored to fork: ${latest_tag}"
+            echo "has_new_release=false" >> "${GITHUB_OUTPUT}"
+            echo "release_tag=${latest_tag}" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [ "${recorded_tag}" = "${latest_tag}" ]; then
+            echo "Latest upstream release already deployed and recorded: ${latest_tag}"
             echo "has_new_release=false" >> "${GITHUB_OUTPUT}"
             echo "release_tag=${latest_tag}" >> "${GITHUB_OUTPUT}"
             exit 0
@@ -56,18 +91,32 @@ jobs:
           echo "has_new_release=true" >> "${GITHUB_OUTPUT}"
           echo "release_tag=${latest_tag}" >> "${GITHUB_OUTPUT}"
 
+      - name: Configure PAT remote for fork mirroring
+        if: ${{ steps.detect.outputs.has_new_release == 'true' && steps.pat.outputs.has_sync_pat == 'true' }}
+        env:
+          SYNC_PAT: ${{ secrets.SYNC_PAT }}
+        run: |
+          git remote add origin-pat "https://x-access-token:${SYNC_PAT}@github.com/${GITHUB_REPOSITORY}.git" || true
+          git remote set-url origin-pat "https://x-access-token:${SYNC_PAT}@github.com/${GITHUB_REPOSITORY}.git"
+
       - name: Sync release tag to fork
-        if: ${{ steps.detect.outputs.has_new_release == 'true' }}
+        if: ${{ steps.detect.outputs.has_new_release == 'true' && steps.pat.outputs.has_sync_pat == 'true' }}
         run: |
           tag="${{ steps.detect.outputs.release_tag }}"
           git fetch upstream "refs/tags/${tag}:refs/tags/${tag}"
-          git push origin "refs/tags/${tag}:refs/tags/${tag}"
+          git push origin-pat "refs/tags/${tag}:refs/tags/${tag}"
 
       - name: Update mirror branch with upstream main
-        if: ${{ steps.detect.outputs.has_new_release == 'true' }}
+        if: ${{ steps.detect.outputs.has_new_release == 'true' && steps.pat.outputs.has_sync_pat == 'true' }}
         run: |
           git fetch upstream "refs/heads/main:refs/remotes/upstream/main"
-          git push origin "refs/remotes/upstream/main:refs/heads/upstream-main"
+          git push origin-pat "refs/remotes/upstream/main:refs/heads/upstream-main"
+
+      - name: Skip fork mirroring without SYNC_PAT
+        if: ${{ steps.detect.outputs.has_new_release == 'true' && steps.pat.outputs.has_sync_pat != 'true' }}
+        run: |
+          echo "SYNC_PAT is not configured. Skipping tag and branch mirroring."
+          echo "Deployment will use the upstream release source directly."
 
   deploy:
     permissions:
@@ -78,4 +127,52 @@ jobs:
     uses: ./.github/workflows/deploy-cloud-run-on-release.yml
     with:
       release_tag: ${{ needs.sync.outputs.release_tag }}
+      source_repository: router-for-me/CLIProxyAPI
     secrets: inherit
+
+  record:
+    permissions:
+      contents: write
+    needs:
+      - sync
+      - deploy
+    if: ${{ needs.sync.outputs.has_new_release == 'true' && needs.deploy.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork default branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Record processed upstream release
+        env:
+          RELEASE_TAG: ${{ needs.sync.outputs.release_tag }}
+        run: |
+          python3 - <<'PY'
+import json
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
+path = Path(".github/upstream-release-state.json")
+path.parent.mkdir(parents=True, exist_ok=True)
+payload = {
+    "latest_release_tag": os.environ["RELEASE_TAG"],
+    "source_repository": "router-for-me/CLIProxyAPI",
+    "updated_at": datetime.now(timezone.utc).isoformat(),
+}
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/upstream-release-state.json
+
+          if git diff --cached --quiet; then
+            echo "No release state changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore: record upstream release ${RELEASE_TAG}"
+          git push origin HEAD:main

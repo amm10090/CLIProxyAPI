@@ -10,9 +10,16 @@ on:
         description: "Tag to deploy (optional)"
         required: false
         type: string
+      source_repository:
+        description: "Repository to checkout for the release source"
+        required: false
+        type: string
   workflow_call:
     inputs:
       release_tag:
+        required: false
+        type: string
+      source_repository:
         required: false
         type: string
 
@@ -37,6 +44,7 @@ jobs:
       - name: Checkout release tag
         uses: actions/checkout@v4
         with:
+          repository: ${{ inputs.source_repository || github.repository }}
           ref: ${{ inputs.release_tag || github.event.release.tag_name || github.ref_name }}
 
       - name: Authenticate to Google Cloud
