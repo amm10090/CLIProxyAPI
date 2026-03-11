@@ -5,20 +5,25 @@ on:
     - cron: "*/30 * * * *"
   workflow_dispatch:
 
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  PROJECT_ID: gen-lang-client-0984777924
+  REGION: us-central1
+  SERVICE: cliproxy
+
 jobs:
-  sync:
-    permissions:
-      contents: write
+  sync_and_deploy:
     runs-on: ubuntu-latest
-    outputs:
-      has_new_release: ${{ steps.detect.outputs.has_new_release }}
-      release_tag: ${{ steps.detect.outputs.release_tag }}
-      has_sync_pat: ${{ steps.pat.outputs.has_sync_pat }}
     steps:
       - name: Checkout fork repository
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
+          path: fork
 
       - name: Detect whether SYNC_PAT is configured
         id: pat
@@ -32,6 +37,7 @@ jobs:
           fi
 
       - name: Fetch upstream and origin tags
+        working-directory: fork
         run: |
           git remote add upstream https://github.com/router-for-me/CLIProxyAPI.git || true
           git fetch upstream --tags --prune
@@ -39,6 +45,7 @@ jobs:
 
       - name: Detect latest upstream release
         id: detect
+        working-directory: fork
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -93,14 +100,16 @@ PY
 
       - name: Configure PAT remote for fork mirroring
         if: ${{ steps.detect.outputs.has_new_release == 'true' && steps.pat.outputs.has_sync_pat == 'true' }}
+        working-directory: fork
         env:
           SYNC_PAT: ${{ secrets.SYNC_PAT }}
         run: |
           git remote add origin-pat "https://x-access-token:${SYNC_PAT}@github.com/${GITHUB_REPOSITORY}.git" || true
           git remote set-url origin-pat "https://x-access-token:${SYNC_PAT}@github.com/${GITHUB_REPOSITORY}.git"
 
-      - name: Sync release tag to fork
+      - name: Mirror release tag to fork
         if: ${{ steps.detect.outputs.has_new_release == 'true' && steps.pat.outputs.has_sync_pat == 'true' }}
+        working-directory: fork
         run: |
           tag="${{ steps.detect.outputs.release_tag }}"
           git fetch upstream "refs/tags/${tag}:refs/tags/${tag}"
@@ -108,6 +117,7 @@ PY
 
       - name: Update mirror branch with upstream main
         if: ${{ steps.detect.outputs.has_new_release == 'true' && steps.pat.outputs.has_sync_pat == 'true' }}
+        working-directory: fork
         run: |
           git fetch upstream "refs/heads/main:refs/remotes/upstream/main"
           git push origin-pat "refs/remotes/upstream/main:refs/heads/upstream-main"
@@ -118,36 +128,55 @@ PY
           echo "SYNC_PAT is not configured. Skipping tag and branch mirroring."
           echo "Deployment will use the upstream release source directly."
 
-  deploy:
-    permissions:
-      contents: read
-      id-token: write
-    needs: sync
-    if: ${{ needs.sync.outputs.has_new_release == 'true' }}
-    uses: ./.github/workflows/deploy-cloud-run-on-release.yml
-    with:
-      release_tag: ${{ needs.sync.outputs.release_tag }}
-      source_repository: router-for-me/CLIProxyAPI
-    secrets: inherit
-
-  record:
-    permissions:
-      contents: write
-    needs:
-      - sync
-      - deploy
-    if: ${{ needs.sync.outputs.has_new_release == 'true' && needs.deploy.result == 'success' }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout fork default branch
+      - name: Checkout upstream release source
+        if: ${{ steps.detect.outputs.has_new_release == 'true' }}
         uses: actions/checkout@v4
         with:
-          ref: main
-          fetch-depth: 0
+          repository: router-for-me/CLIProxyAPI
+          ref: ${{ steps.detect.outputs.release_tag }}
+          path: source
+
+      - name: Authenticate to Google Cloud
+        if: ${{ steps.detect.outputs.has_new_release == 'true' }}
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: code-584@gen-lang-client-0984777924.iam.gserviceaccount.com
+
+      - name: Set up gcloud SDK
+        if: ${{ steps.detect.outputs.has_new_release == 'true' }}
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Show active gcloud account
+        if: ${{ steps.detect.outputs.has_new_release == 'true' }}
+        run: gcloud auth list --filter=status:ACTIVE --format="value(account)"
+
+      - name: Deploy upstream release to Cloud Run
+        if: ${{ steps.detect.outputs.has_new_release == 'true' }}
+        working-directory: source
+        run: |
+          gcloud run deploy "${SERVICE}" \
+            --project "${PROJECT_ID}" \
+            --region "${REGION}" \
+            --platform managed \
+            --port 8317 \
+            --source . \
+            --quiet
+
+      - name: Show latest ready revision
+        if: ${{ steps.detect.outputs.has_new_release == 'true' }}
+        run: |
+          gcloud run services describe "${SERVICE}" \
+            --project "${PROJECT_ID}" \
+            --region "${REGION}" \
+            --platform managed \
+            --format="value(status.latestReadyRevisionName)"
 
       - name: Record processed upstream release
+        if: ${{ steps.detect.outputs.has_new_release == 'true' }}
+        working-directory: fork
         env:
-          RELEASE_TAG: ${{ needs.sync.outputs.release_tag }}
+          RELEASE_TAG: ${{ steps.detect.outputs.release_tag }}
         run: |
           python3 - <<'PY'
 import json
